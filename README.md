@@ -1,12 +1,37 @@
 # linfer
 
-linfer sets up the best local inference backend for one model on the machine
-it runs on, without the hassle. It looks at the hardware, installs the right
-backend (llama.cpp's `llama-server`, or oMLX on Apple Silicon), fetches the
-weights, sizes the launch to the memory left after them, runs the backend
-under supervision, and tells your client one URL and one model id that never
-change. It is not a proxy: requests go from your client straight to the
-backend's own OpenAI-compatible `/v1` endpoint.
+[![test](https://github.com/sudiptadeb/linfer/actions/workflows/test.yml/badge.svg)](https://github.com/sudiptadeb/linfer/actions/workflows/test.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/sudiptadeb/linfer.svg)](https://pkg.go.dev/github.com/sudiptadeb/linfer)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+
+**The best local inference setup for your machine, without the hassle.**
+
+linfer looks at the hardware, installs the right backend (llama.cpp's
+`llama-server`, or oMLX on Apple Silicon), fetches the weights, sizes the
+launch to the memory left after them, runs the backend under supervision, and
+tells your client one URL and one model id that never change. It is not a
+proxy: requests go from your client straight to the backend's own
+OpenAI-compatible `/v1` endpoint.
+
+<p align="center">
+  <img src="docs/img/doctor.gif" alt="linfer doctor on a 256 GB Apple Silicon machine: it finds both backends, picks oMLX because MLX weights are present, sizes 6 concurrent requests of 262k tokens into the 62.5 GiB left after the weights, and prints the URL and model id for the client" width="100%">
+</p>
+
+## Why it exists
+
+One model, the same 8-bit weights, three runtimes, on one 256 GB Apple
+Silicon machine (a ~125B mixture-of-experts model; measured, not quoted):
+
+| | Ollama 0.34 | llama.cpp, current | oMLX + multi-token prediction |
+|---|---:|---:|---:|
+| one agent: a replayed real agent call | 37.2 s | not run | **14.4 s** |
+| eight agents × 33k context: combined tok/s | 52 | **104** | 85 |
+| replayed tool calls valid | 50 / 52 | 52 / 52 | 52 / 52 |
+
+The fastest runtime depends on the machine and on how many agents share it,
+and the defaults most people start with leave a lot on the table. linfer
+makes the choice, measures it with `linfer bench`, and lets you change your
+mind with one command.
 
 ## What it does
 
@@ -226,7 +251,7 @@ failures                   0                        0
 Variants are rows: a backend with a twist (a speculative decoder, another
 quantisation) can be added as another `Variant` without touching the suites.
 
-## Why
+## Where the defaults come from
 
 The sizing constants come from one reference machine, a 256 GB Apple
 Silicon workstation, and reproduce what was measured there:
@@ -235,8 +260,9 @@ Silicon workstation, and reproduce what was measured there:
   llama.cpp `llama-server` gave twice Ollama's combined output at 8
   concurrent sessions of 33k context (104 against 52 tokens/s), with every
   replayed tool call intact.
-- oMLX with multi-token prediction was about 2× faster again for a single
-  stream on that machine, which is why `auto` prefers it there; 8 concurrent
+- oMLX with multi-token prediction decoded a single stream 2.6× faster than
+  llama.cpp (104 against 39 tokens/s at 2k context), which is why `auto`
+  prefers it there; 8 concurrent
   ~65k-token requests ran it out of Metal memory and 6 did not, hence the
   cap.
 - A 176 GiB GGUF on that machine gets 8 slots of 131,072 tokens with a 16 GiB
