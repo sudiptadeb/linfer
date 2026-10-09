@@ -43,15 +43,17 @@ type SpeedRow struct {
 	ContextTokens int    `json:"context_tokens"` // as the backend counted the prompt
 	Concurrency   int    `json:"concurrency"`
 	Runs          int    `json:"runs"`
-	// Per stream, median across streams and runs.
+	// Per stream, median across streams and runs. TTFT and Prefill come
+	// from the cold pass: every stream's new prompt arriving at once.
+	// DecodeTPS comes from the warm pass.
 	DecodeTPS Stat `json:"decode_tps"`
 	TTFT      Stat `json:"ttft_s"`
 	Prefill   Stat `json:"prefill_tps"`
-	// Combined decode of all streams: total tokens over the window from the
-	// first stream's first token to the last stream's last.
+	// Combined output of the warm pass: all streams' tokens over the wall
+	// time from the first request sent to the last stream's end.
 	CombinedTPS Stat `json:"combined_tps"`
-	// WarmTTFT is the time to first token when the same prompt is sent
-	// again at once (concurrency 1 only): the prompt cache at work.
+	// WarmTTFT is the warm pass's time to first token (concurrency 1 only):
+	// the prompt cache at work, as on an agent's next turn.
 	WarmTTFT Stat `json:"warm_ttft_s,omitempty"`
 	// The backend's own decode and prefill rates, where it reports them.
 	ServerDecode  Stat `json:"server_decode_tps,omitempty"`
@@ -73,6 +75,11 @@ type speedPlan struct {
 	decodeTokens  int
 	charsPerToken float64
 	maxContext    int // the slot's; larger contexts are skipped
+	// settle is the pause between the cold and the warm pass. oMLX commits
+	// a prompt to its cache a moment after the request ends: a repeat sent
+	// at once was measured missing it (1.84 s to first token on a 2k
+	// prompt), one sent a second later hitting it (0.12 s).
+	settle time.Duration
 }
 
 // calibrate measures how many characters make a token on this backend, so
@@ -92,9 +99,19 @@ func calibrate(ctx context.Context, cl *Client) (float64, error) {
 	return float64(len(text)) / float64(st.PromptTokens-20), nil // ~20 tokens of template
 }
 
-// runSpeed measures each cell. Each run of a cell sends `concurrency`
-// streams at once, each with its own cold prompt of the target size, and
-// takes the per-stream numbers from every stream.
+// runSpeed measures each cell. A run of a cell is two passes over
+// `concurrency` new prompts of the target size, all sent at once each time:
+//
+//   - cold: one token each, for time to first token and prefill with every
+//     prompt arriving together;
+//   - warm, after settle: decodeTokens each on the now-cached prompts, for
+//     per-stream decode and combined output.
+//
+// The warm pass is the shape of an agent's turn: a cached history, a little
+// new input, a long reply. Measuring combined output on cold prompts with a
+// short reply instead measures how the backend queues prefill: oMLX takes
+// new prompts one at a time, so 4 cold 2k prompts with 64-token replies
+// read 31 tok/s combined where the same model decodes 112 on warm ones.
 func runSpeed(ctx context.Context, cl *Client, p speedPlan, progress func(string)) []SpeedRow {
 	var rows []SpeedRow
 	for _, ctxTokens := range p.contexts {
@@ -117,56 +134,48 @@ func runSpeed(ctx context.Context, cl *Client, p speedPlan, progress func(string
 					prompts[i] = prose(int(float64(ctxTokens)*p.charsPerToken), fmt.Sprintf("%s-s%d", nonce, i)) +
 						"\nContinue the log in the same style for several more entries."
 				}
-				streams := make([]Stream, conc)
-				starts := make([]time.Time, conc)
-				var wg sync.WaitGroup
-				for i := range prompts {
-					wg.Add(1)
-					go func(i int) {
-						defer wg.Done()
-						starts[i] = time.Now()
-						streams[i] = cl.Complete(ctx, []Message{{Role: "user", Content: prompts[i]}}, p.decodeTokens)
-					}(i)
+				cold, _ := together(ctx, cl, prompts, 1)
+				ok := true
+				for i, st := range cold {
+					if st.Err != "" {
+						row.Failures = append(row.Failures, fmt.Sprintf("run %d stream %d (cold): %s", run, i, st.Err))
+						ok = false
+						continue
+					}
+					if row.ContextTokens == 0 {
+						row.ContextTokens = st.PromptTokens
+					}
+					ttft = append(ttft, st.TTFT.Seconds())
+					prefill = append(prefill, st.PrefillTPS())
+					sprefill = append(sprefill, st.ServerPrefillTPS())
 				}
-				wg.Wait()
-				var total int // decode tokens after each stream's first chunk
-				var firstTok, lastTok time.Time
+				if !ok {
+					continue
+				}
+				select {
+				case <-ctx.Done():
+				case <-time.After(p.settle):
+				}
+				streams, wall := together(ctx, cl, prompts, p.decodeTokens)
+				var total int
 				for i, st := range streams {
 					if st.Err != "" {
 						row.Failures = append(row.Failures, fmt.Sprintf("run %d stream %d: %s", run, i, st.Err))
 						continue
 					}
-					total += st.CompletionTokens - st.FirstChunkTokens(p.charsPerToken)
-					if row.ContextTokens == 0 {
-						row.ContextTokens = st.PromptTokens
-					}
+					total += st.CompletionTokens
 					decode = append(decode, st.DecodeTPS(p.charsPerToken))
-					ttft = append(ttft, st.TTFT.Seconds())
-					prefill = append(prefill, st.PrefillTPS())
 					sdecode = append(sdecode, st.ServerDecodeTPS())
-					sprefill = append(sprefill, st.ServerPrefillTPS())
 					granularity = append(granularity, st.TokensPerChunk())
+					if conc == 1 {
+						warm = append(warm, st.TTFT.Seconds())
+					}
 					for k, v := range st.Server {
 						server[k] = append(server[k], v)
 					}
-					ft := starts[i].Add(st.TTFT)
-					lt := starts[i].Add(st.Total)
-					if firstTok.IsZero() || ft.Before(firstTok) {
-						firstTok = ft
-					}
-					if lt.After(lastTok) {
-						lastTok = lt
-					}
 				}
-				if total > 0 && lastTok.After(firstTok) {
-					combined = append(combined, float64(total)/lastTok.Sub(firstTok).Seconds())
-				}
-				// The warm check: the same prompt again, at once.
-				if conc == 1 && streams[0].Err == "" {
-					w := cl.Complete(ctx, []Message{{Role: "user", Content: prompts[0]}}, 8)
-					if w.Err == "" {
-						warm = append(warm, w.TTFT.Seconds())
-					}
+				if total > 0 && wall > 0 {
+					combined = append(combined, float64(total)/wall.Seconds())
 				}
 			}
 			row.DecodeTPS = Summarise(decode)
@@ -180,13 +189,30 @@ func runSpeed(ctx context.Context, cl *Client, p speedPlan, progress func(string
 			for k, v := range server {
 				row.Server[k] = Median(v)
 			}
-			progress(fmt.Sprintf("    %s × %d: %.1f tok/s per stream, %.1f combined, TTFT %.2fs, prefill %.0f tok/s%s",
+			progress(fmt.Sprintf("    %s × %d: %.1f tok/s per stream, %.1f combined, TTFT %.2fs cold, prefill %.0f tok/s%s",
 				row.Context, conc, row.DecodeTPS.Median, row.CombinedTPS.Median, row.TTFT.Median, row.Prefill.Median,
 				ifs(len(row.Failures) > 0, fmt.Sprintf(", %d failures", len(row.Failures)), "")))
 			rows = append(rows, row)
 		}
 	}
 	return rows
+}
+
+// together sends every prompt at once and returns the streams and the wall
+// time from the first request sent to the last stream's end.
+func together(ctx context.Context, cl *Client, prompts []string, maxTokens int) ([]Stream, time.Duration) {
+	streams := make([]Stream, len(prompts))
+	t0 := time.Now()
+	var wg sync.WaitGroup
+	for i := range prompts {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			streams[i] = cl.Complete(ctx, []Message{{Role: "user", Content: prompts[i]}}, maxTokens)
+		}(i)
+	}
+	wg.Wait()
+	return streams, time.Since(t0)
 }
 
 func tokensLabel(n int) string {

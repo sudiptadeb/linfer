@@ -197,6 +197,7 @@ func testSetup(t *testing.T) (linfer.Config, *linfer.Supervisor, *Runner, *bool)
 		return linfer.Plan{Backend: v.Backend, Slots: 2, Context: 4096, Weights: 100 * linfer.MiB}, cfg.GGUFPath(), nil
 	}
 	r.FreeMemory = func() uint64 { return 1 << 40 }
+	r.Settle = 10 * time.Millisecond
 	r.Start = func(ctx context.Context, v Variant, plan linfer.Plan) (*Running, error) {
 		// Seen from the launch: the daemon must be paused by now.
 		if st, err := (linfer.Client{Socket: cfg.Paths().Socket}).Status(ctx); err == nil && st.Paused && st.PID == 0 {

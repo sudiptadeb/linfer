@@ -122,7 +122,7 @@ func WriteTable(w io.Writer, r Results) {
 		row(fmt.Sprintf("combined tok/s %s×%d", ctxLabel, conc), func(b BackendResult) string {
 			return statStr(b.speedAt(ctxLabel, conc), func(s *SpeedRow) Stat { return s.CombinedTPS }, "%.1f")
 		})
-		row(fmt.Sprintf("ttft s %s×%d", ctxLabel, conc), func(b BackendResult) string {
+		row(fmt.Sprintf("cold ttft s %s×%d", ctxLabel, conc), func(b BackendResult) string {
 			return statStr(b.speedAt(ctxLabel, conc), func(s *SpeedRow) Stat { return s.TTFT }, "%.2f")
 		})
 		row(fmt.Sprintf("prefill tok/s %s×%d", ctxLabel, conc), func(b BackendResult) string {
@@ -402,7 +402,7 @@ func Markdown(r Results) string {
 	WriteTable(&b, r)
 	fmt.Fprintln(&b, "```")
 	fmt.Fprintln(&b)
-	fmt.Fprintln(&b, "Decode and prefill are measured on the client from the stream; combined tok/s is all streams' tokens over the window from the first stream's first token to the last stream's last. Medians, with min–max in brackets when there was more than one run.")
+	fmt.Fprintln(&b, "Each cell is two passes over new prompts sent all at once: a cold pass (one token each) gives time to first token and prefill with every prompt arriving together; after a short settle, a warm pass on the now-cached prompts gives decode, combined tok/s (all streams' tokens over the wall time of the pass) and, for one stream, the warm time to first token. The warm pass is the shape of an agent's turn: a cached history and a long reply. Decode and prefill are measured on the client from the stream. Medians, with min–max in brackets when there was more than one run.")
 	for _, bk := range r.Backends {
 		if bk.Tools != nil && len(bk.Tools.Failures) > 0 {
 			fmt.Fprintf(&b, "\n### %s: tool failures\n\n", bk.Name)

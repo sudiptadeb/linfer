@@ -154,9 +154,16 @@ exit so the memory is free, then the next. If a `linfer serve` daemon for
 this config is running it is paused over the control socket first and
 resumed at the end, also on Ctrl-C or an error. Three suites:
 
-- **speed**: for each context size and concurrency level, decode tok/s per
-  stream and combined, time to first token and prefill tok/s on a cold
-  prompt, and a warm (second-turn) time to first token. Measured on the
+- **speed**: for each context size and concurrency level, two passes over
+  new prompts sent all at once. The cold pass (one token each) gives time to
+  first token and prefill tok/s with every prompt arriving together. After a
+  short settle, the warm pass on the now-cached prompts gives decode tok/s
+  per stream, combined tok/s (all streams' tokens over the pass's wall time)
+  and the warm time to first token: the shape of an agent's turn, a cached
+  history and a long reply. Combined output on cold prompts with short
+  replies would instead measure how a backend queues prefill (oMLX takes new
+  prompts one at a time), which can read a third of the decode throughput
+  the same backend gives agents. Measured on the
   client from the stream, identically for every backend; the backend's own
   figures (llama-server's `timings`, oMLX's `usage`) are shown beside them,
   with the stream's granularity (tokens per chunk), since a backend that
@@ -179,8 +186,8 @@ It prints a comparison table and a short verdict, and writes `report.md` and
 names the fastest single stream, the most combined output at the top
 concurrency, tool accuracy per backend and any failures, and says when a
 difference is within the runs' own spread. A sample, from a quick run of a
-0.6B model on both backends (small on purpose; the numbers are the format,
-not a recommendation):
+0.6B model on both backends (small on purpose, and from before the cold/warm
+split; the numbers are the format, not a recommendation):
 
 ```
 metric                         llama                 mlx
@@ -191,7 +198,7 @@ decode tok/s/stream 512×1      312.2                 430.1
   server-reported              300.9                 381.6
   tokens per stream chunk      1.0                   32.0
 combined tok/s 512×1           312.2                 430.1
-ttft s 512×1                   0.06                  0.15
+cold ttft s 512×1              0.06                  0.15
 prefill tok/s 512×1            8749                  3615
   server-reported              11658                 12553
 warm ttft s 512                0.01                  0.11

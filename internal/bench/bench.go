@@ -44,14 +44,14 @@ func (o *Options) Defaults() {
 		setIf(&o.Concurrency, []int{1, 4})
 		setIf(&o.Contexts, []int{2048})
 		setInt(&o.Runs, 1)
-		setInt(&o.DecodeTokens, 64)
+		setInt(&o.DecodeTokens, 256)
 		setInt(&o.ToolRuns, 1)
 		setIf(&o.Depths, []int{50})
 	} else {
 		setIf(&o.Concurrency, []int{1, 2, 4, 8})
 		setIf(&o.Contexts, []int{2048, 32768})
 		setInt(&o.Runs, 3)
-		setInt(&o.DecodeTokens, 128)
+		setInt(&o.DecodeTokens, 512)
 		setInt(&o.ToolRuns, 3)
 		setIf(&o.Depths, []int{10, 50, 90})
 	}
@@ -168,6 +168,16 @@ type Runner struct {
 	// so a check made just after pausing the daemon or stopping the
 	// previous backend reads low.
 	MemoryWait time.Duration
+	// Settle is the speed suite's pause between its cold and warm passes,
+	// for the backend to commit the prompts to its cache; zero means 2 s.
+	Settle time.Duration
+}
+
+func (r *Runner) settle() time.Duration {
+	if r.Settle > 0 {
+		return r.Settle
+	}
+	return 2 * time.Second
 }
 
 // New is the production runner.
@@ -304,15 +314,11 @@ func (r *Runner) announce(variants []Variant) {
 	if o.has("speed") {
 		for _, c := range o.Contexts {
 			for _, conc := range o.Concurrency {
-				n := o.Runs * conc
-				requests += n
-				// A rough cost model: prefill at 500 tok/s, decode at 30
-				// tok/s per stream, concurrent streams sharing the decode.
-				seconds += float64(o.Runs) * (float64(c)/500*float64(conc) + float64(o.DecodeTokens)/30*1.5)
-				if conc == 1 {
-					requests += o.Runs
-					seconds += float64(o.Runs) * 2
-				}
+				requests += 2 * o.Runs * conc // a cold and a warm pass
+				// A rough cost model: prefill at 500 tok/s, the settle,
+				// decode at 30 tok/s per stream, concurrent streams sharing
+				// the decode.
+				seconds += float64(o.Runs) * (float64(c)/500*float64(conc) + r.settle().Seconds() + float64(o.DecodeTokens)/30*1.5)
 			}
 		}
 	}
@@ -406,7 +412,7 @@ func (r *Runner) runVariant(ctx context.Context, v Variant) BackendResult {
 		r.say("  speed")
 		br.Speed = runSpeed(ctx, cl, speedPlan{
 			contexts: r.Opts.Contexts, concurrency: r.Opts.Concurrency, runs: r.Opts.Runs,
-			decodeTokens: r.Opts.DecodeTokens, charsPerToken: cpt, maxContext: maxCtx,
+			decodeTokens: r.Opts.DecodeTokens, charsPerToken: cpt, maxContext: maxCtx, settle: r.settle(),
 		}, progress)
 	}
 	if r.Opts.has("tools") && ctx.Err() == nil {
