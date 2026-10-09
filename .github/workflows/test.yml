@@ -15,8 +15,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      # The current Go, not go.mod's minimum: Go 1.22's linker leaves out the
+      # LC_UUID load command, and the macOS runner's dyld refuses to start a
+      # test binary without it.
       - uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          go-version: stable
       - run: go vet ./...
       - run: go test -count=1 ./...
