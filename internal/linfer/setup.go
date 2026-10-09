@@ -344,37 +344,44 @@ func run(ctx context.Context, out io.Writer, env []string, name string, args ...
 
 // PrintHardware is the machine as doctor and setup show it.
 func PrintHardware(w io.Writer, h Hardware) {
-	fmt.Fprintf(w, "machine: %s/%s, %s, %d CPUs, %s RAM\n", h.OS, h.Arch, h.Chip, h.CPUs, HumanBytes(h.RAM))
+	p := painterFor(w)
+	fmt.Fprintf(w, "%s %s/%s, %s, %d CPUs, %s RAM\n", p.label("machine:"), h.OS, h.Arch, h.Chip, h.CPUs, HumanBytes(h.RAM))
 	switch {
 	case h.GPU == GPUCPU:
-		fmt.Fprintf(w, "gpu:     none usable (CPU build; sizing against 80%% of RAM)\n")
+		fmt.Fprintf(w, "%s none usable (CPU build; sizing against 80%% of RAM)\n", p.label("gpu:"))
 	case h.GPUMem > 0:
-		fmt.Fprintf(w, "gpu:     %s %s, %s usable (%s)", h.GPU, h.GPUName, HumanBytes(h.GPUMem), h.GPUMemSource)
+		fmt.Fprintf(w, "%s %s %s, %s usable %s", p.label("gpu:"), h.GPU, h.GPUName, p.bold(HumanBytes(h.GPUMem)), p.dim("("+h.GPUMemSource+")"))
 		if h.CUDAVersion != "" {
 			fmt.Fprintf(w, ", CUDA %s", h.CUDAVersion)
 		}
 		fmt.Fprintln(w)
 	default:
-		fmt.Fprintf(w, "gpu:     %s %s, memory unknown (%s); sizing against 80%% of RAM\n", h.GPU, h.GPUName, h.GPUMemSource)
+		fmt.Fprintf(w, "%s %s %s, memory unknown (%s); sizing against 80%% of RAM\n", p.label("gpu:"), h.GPU, h.GPUName, h.GPUMemSource)
 	}
-	fmt.Fprintf(w, "disk:    %s free at %s\n", HumanBytes(h.DiskFree), h.DiskPath)
+	fmt.Fprintf(w, "%s %s free at %s\n", p.label("disk:"), HumanBytes(h.DiskFree), h.DiskPath)
 	// macOS caps what one process may wire for the GPU below the RAM; the
 	// cap is an operator's sysctl. Worth knowing when a model is close.
 	if h.GPU == GPUMetal && h.GPUMemSource != "sysctl iogpu.wired_limit_mb" && h.RAM > h.GPUMem+16*GiB {
-		fmt.Fprintf(w, "note:    macOS lets the GPU use %s of %s by default; to raise it: sudo sysctl iogpu.wired_limit_mb=%d (not persistent across reboots)\n",
-			HumanBytes(h.GPUMem), HumanBytes(h.RAM), (h.RAM-8*GiB)/MiB)
+		fmt.Fprintf(w, "%s macOS lets the GPU use %s of %s by default; to raise it: sudo sysctl iogpu.wired_limit_mb=%d (not persistent across reboots)\n",
+			p.label("note:"), HumanBytes(h.GPUMem), HumanBytes(h.RAM), (h.RAM-8*GiB)/MiB)
 	}
 }
 
 // PrintReport is the rest of doctor's and setup's output.
 func PrintReport(w io.Writer, r Report) {
+	p := painterFor(w)
 	mark := func(ok bool) string {
 		if ok {
-			return "ok     "
+			return p.good("ok     ")
 		}
-		return "MISSING"
+		return p.bad("MISSING")
 	}
-	fmt.Fprintf(w, "%s\n", r.Reason)
+	if rest, ok := strings.CutPrefix(r.Reason, "backend: "); ok {
+		name, why, _ := strings.Cut(rest, " ")
+		fmt.Fprintf(w, "%s %s %s\n", p.label("backend:"), p.bold(name), why)
+	} else {
+		fmt.Fprintf(w, "%s\n", r.Reason)
+	}
 	fmt.Fprintf(w, "  %s llama-server  %s\n", mark(r.LlamaOK), r.LlamaBin)
 	if r.OMLXBin != "" {
 		fmt.Fprintf(w, "  %s omlx          %s\n", mark(r.OMLXOK), r.OMLXBin)
@@ -387,27 +394,27 @@ func PrintReport(w io.Writer, r Report) {
 	}
 	if r.Model.Arch != "" {
 		m := r.Model
-		fmt.Fprintf(w, "model:   %s (%s): %d layers (%d attention), %d KV heads × %d, context %d, %s on disk, %d KiB KV per token\n",
-			m.Name, m.Arch, m.Layers, m.AttnLayers, m.KVHeads, m.HeadK, m.Context, HumanBytes(uint64(m.WeightBytes)), m.KVBytesPerToken()/1024)
+		fmt.Fprintf(w, "%s %s (%s): %d layers (%d attention), %d KV heads × %d, context %d, %s on disk, %d KiB KV per token\n",
+			p.label("model:"), p.bold(m.Name), m.Arch, m.Layers, m.AttnLayers, m.KVHeads, m.HeadK, m.Context, HumanBytes(uint64(m.WeightBytes)), m.KVBytesPerToken()/1024)
 	}
 	for _, n := range r.Plan.Notes {
-		fmt.Fprintf(w, "  %s\n", n)
+		fmt.Fprintf(w, "  %s\n", p.dim(n))
 	}
 	if len(r.Problems) > 0 {
-		fmt.Fprintln(w, "problems:")
-		for _, p := range r.Problems {
-			fmt.Fprintf(w, "  - %s\n", p)
+		fmt.Fprintln(w, p.bad("problems:"))
+		for _, pr := range r.Problems {
+			fmt.Fprintf(w, "  - %s\n", pr)
 		}
 		return
 	}
 	fmt.Fprintln(w)
 	switch r.Plan.Backend {
 	case BackendLlama:
-		fmt.Fprintf(w, "launch:  llama-server, %d slots × %d tokens, cache-ram %d MB\n", r.Plan.Slots, r.Plan.Context, r.Plan.CacheRAMMB)
+		fmt.Fprintf(w, "%s %s\n", p.label("launch:"), p.bold(fmt.Sprintf("llama-server, %d slots × %d tokens, cache-ram %d MB", r.Plan.Slots, r.Plan.Context, r.Plan.CacheRAMMB)))
 	case BackendMLX:
-		fmt.Fprintf(w, "launch:  omlx, %d concurrent requests, context window %d\n", r.Plan.MaxConcurrent, r.Plan.ContextWindow)
+		fmt.Fprintf(w, "%s %s\n", p.label("launch:"), p.bold(fmt.Sprintf("omlx, %d concurrent requests, context window %d", r.Plan.MaxConcurrent, r.Plan.ContextWindow)))
 	}
-	fmt.Fprintf(w, "url:     %s\n", r.URL)
-	fmt.Fprintf(w, "model:   %s\n", r.ModelID)
-	fmt.Fprintf(w, "client:  an OpenAI-compatible provider with base_url %s and model %q\n", r.URL, r.ModelID)
+	fmt.Fprintf(w, "%s %s\n", p.label("url:"), p.good(r.URL))
+	fmt.Fprintf(w, "%s %s\n", p.label("model:"), p.good(r.ModelID))
+	fmt.Fprintf(w, "%s an OpenAI-compatible provider with base_url %s and model %q\n", p.label("client:"), r.URL, r.ModelID)
 }
