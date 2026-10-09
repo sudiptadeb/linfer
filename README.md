@@ -217,36 +217,30 @@ It prints a comparison table with a short verdict, and writes `results.json`,
 light and dark) to `--out` (default `<dir>/bench/<timestamp>`). The verdict
 names the fastest single stream, the most combined output at the top
 concurrency, tool accuracy per backend and any failures, and says when a
-difference is within the runs' own spread. A sample, from a quick run of a
-0.6B model on both backends (small on purpose; the numbers are the format,
-not a recommendation):
+difference is within the runs' own spread.
 
-```
-metric                     llama                    mlx
-server                     llama.cpp                oMLX
-weights                    0.6 GiB                  0.3 GiB
-launch                     8×40960, cache 16384 MB  6 concurrent, window 40960
-load                       7s, rss 38.2 GiB         3s, rss 815 MiB
-decode tok/s/stream 2k×1   276.5                    342.5
-  server-reported          274.1                    340.1
-  tokens per stream chunk  1.0                      32.0
-combined tok/s 2k×1        250.9                    294.8
-cold ttft s 2k×1           0.17                     0.25
-prefill tok/s 2k×1         12149                    8480
-  server-reported          12991                    8762
-warm ttft s 2k             0.10                     0.22
-decode tok/s/stream 2k×4   205.9 (205.9–205.9)      174.5 (165.3–177.6)
-combined tok/s 2k×4        643.0                    527.3
-tools accuracy             89% (8/9)                89% (8/9)
-needle found               1 of 1                   1 of 1
-failures                   0                        0
+A real run, `linfer bench --contexts 8k,32k --concurrency 1,4,8 --runs 1`
+on a 256 GB M3 Ultra with one ~125B mixture-of-experts model at 8-bit, served
+by each backend in turn (31 minutes, both loads included). The top of its
+`report.html`:
 
-- fastest single stream (2k context): mlx at 342.5 tok/s, 1.24× llama (276.5)
-- most combined output (2k context, 4 streams): llama at 643.0 tok/s, 1.22× mlx (527.3)
-- tool accuracy: llama 89% (8/9), mlx 89% (8/9)
-- needle retrieved: llama 1/1, mlx 1/1
-- single run per cell: no spread to judge noise by, so treat differences under ~10% as unproven
-```
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/img/bench-report-dark.png">
+    <img src="docs/img/bench-report-light.png" alt="linfer-bench report: oMLX decodes one stream 2.73 times faster than llama.cpp (102.0 against 37.3 tokens/s at 8k context), llama.cpp gives 1.72 times the combined output at 32k context with 8 streams (96.8 against 56.2), both 9 of 9 on tool calls and 6 of 6 on needle retrieval" width="100%">
+  </picture>
+</p>
+
+oMLX with multi-token prediction wins every single-stream cell; llama.cpp
+pulls ahead as streams and context grow, and the tools and needle suites tie.
+That is the trade `auto` and `linfer switch` are for. The terminal table,
+with the server's own figures and the tokens per stream chunk beside each
+client-side number:
+
+<details>
+<summary>the full terminal table</summary>
+<p align="center"><img src="docs/img/bench-table.png" alt="the full linfer bench terminal table for llama.cpp against oMLX at 8k and 32k context and 1, 4 and 8 streams" width="760"></p>
+</details>
 
 Variants are rows: a backend with a twist (a speculative decoder, another
 quantisation) can be added as another `Variant` without touching the suites.
