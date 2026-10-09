@@ -139,6 +139,82 @@ reasoning effort.
 Every explicit value in the config overrides its computed one, and a
 configuration past the budget runs as told with a warning in the report.
 
+## Benchmark your machine
+
+```sh
+linfer bench --quick                       # a few minutes: both backends, one run per cell
+linfer bench                               # the full run: 3 runs per cell, 2k and 32k contexts, 1/2/4/8 streams
+linfer bench --backends llama --suites speed --contexts 2k,32k --concurrency 1,8 --out ./bench
+```
+
+`bench` runs every backend this machine can run for the configured model
+(`--backends all`, or a list), **one at a time**, each launched with exactly
+the profile `serve` would use: load, warm up, measure, stop, wait for the
+exit so the memory is free, then the next. If a `linfer serve` daemon for
+this config is running it is paused over the control socket first and
+resumed at the end, also on Ctrl-C or an error. Three suites:
+
+- **speed**: for each context size and concurrency level, decode tok/s per
+  stream and combined, time to first token and prefill tok/s on a cold
+  prompt, and a warm (second-turn) time to first token. Measured on the
+  client from the stream, identically for every backend; the backend's own
+  figures (llama-server's `timings`, oMLX's `usage`) are shown beside them,
+  with the stream's granularity (tokens per chunk), since a backend that
+  streams in bursts looks different to a client than one that streams a
+  token at a time. Medians of N runs, with the range.
+- **tools**: nine tool-calling cases over generic schemas (weather with an
+  enum, calculator, file read/write, web search with an integer, a calendar
+  event with a nested object and an array, an account lookup): the right
+  tool among several, schema-valid arguments, valid JSON, no call when none
+  is needed, two calls in one turn, a follow-up after a tool result, and a
+  10-digit id copied exactly from earlier context as a string. Scored for
+  valid calls, right tool, schema, no-call correctness, reasoning or markup
+  leaking into content, and HTTP errors (an oMLX prefill-memory 400 is a
+  failure, listed).
+- **context**: needle-in-haystack at several depths, at each context size
+  up to the slot's. Exact retrieval or not.
+
+It prints a comparison table and a short verdict, and writes `report.md` and
+`results.json` to `--out` (default `<dir>/bench/<timestamp>`). The verdict
+names the fastest single stream, the most combined output at the top
+concurrency, tool accuracy per backend and any failures, and says when a
+difference is within the runs' own spread. A sample, from a quick run of a
+0.6B model on both backends (small on purpose; the numbers are the format,
+not a recommendation):
+
+```
+metric                         llama                 mlx
+weights                        0.5 GiB               0.3 GiB
+load                           1s, rss 2.2 GiB       2s, rss 797 MiB
+launch                         2×4096, cache 256 MB  2 concurrent, window 4096
+decode tok/s/stream 512×1      312.2                 430.1
+  server-reported              300.9                 381.6
+  tokens per stream chunk      1.0                   32.0
+combined tok/s 512×1           312.2                 430.1
+ttft s 512×1                   0.06                  0.15
+prefill tok/s 512×1            8749                  3615
+  server-reported              11658                 12553
+warm ttft s 512                0.01                  0.11
+decode tok/s/stream 512×2      278.0 (278.0–278.1)   318.9 (312.8–325.0)
+combined tok/s 512×2           555.8                 539.5
+…
+tools accuracy                 100% (9/9)            100% (9/9)
+  valid / right tool / schema  7 / 7 / 7 of 7        7 / 7 / 7 of 7
+  no-call correct              2 of 2                2 of 2
+  leaks / http errors          0 / 0                 0 / 0
+needle found                   1 of 2                2 of 2
+failures                       0                     0
+
+- fastest single agent (512 context, 1 stream): mlx at 430.1 tok/s, 1.38× llama (312.2)
+- most combined output (1k context, 2 streams): llama at 518.2 tok/s; mlx at 498.3 is within noise
+- tool accuracy: llama 100% (9/9), mlx 100% (9/9)
+- needle retrieved: llama 1/2, mlx 2/2
+- single run per cell: no spread to judge noise by, so treat differences under ~10% as unproven
+```
+
+Variants are rows: a backend with a twist (a speculative decoder, another
+quantisation) can be added as another `Variant` without touching the suites.
+
 ## Why
 
 The sizing constants come from one reference machine, a 256 GB Apple

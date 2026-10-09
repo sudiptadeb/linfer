@@ -8,6 +8,9 @@
 //	linfer pause              stop the backend and free its memory; the daemon stays up
 //	linfer resume             start it again
 //	linfer switch llama|mlx|auto
+//	linfer bench [--backends all|llama,mlx] [--suites speed,tools,context]
+//	             [--concurrency 1,2,4,8] [--contexts 2k,32k] [--quick] [--out DIR]
+//	                          compare every backend this machine can run for the model
 //
 // -config names the file; the default is ~/.config/linfer/linfer.yaml.
 package main
@@ -21,9 +24,11 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/sudiptadeb/linfer/internal/bench"
 	"github.com/sudiptadeb/linfer/internal/linfer"
 )
 
@@ -31,7 +36,7 @@ func main() {
 	fs := flag.NewFlagSet("linfer", flag.ContinueOnError)
 	cfgPath := fs.String("config", linfer.DefaultConfigPath(), "config file")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: linfer [-config FILE] setup|doctor|serve|status|pause|resume|switch BACKEND")
+		fmt.Fprintln(os.Stderr, "usage: linfer [-config FILE] setup|doctor|serve|status|pause|resume|switch BACKEND|bench [flags]")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(os.Args[1:]); err != nil {
@@ -83,6 +88,8 @@ func run(cfgPath, cmd string, args []string) error {
 		return nil
 	case "serve":
 		return serve(ctx, cfg)
+	case "bench":
+		return runBench(ctx, cfg, args)
 	}
 
 	// The rest talk to a running daemon.
@@ -168,6 +175,47 @@ func printStatus(st linfer.Status) {
 	if st.LastError != "" {
 		fmt.Printf("last err  %s\n", st.LastError)
 	}
+}
+
+// runBench compares the backends this machine can run for the model, one at
+// a time, each launched as serve would launch it.
+func runBench(ctx context.Context, cfg linfer.Config, args []string) error {
+	fs := flag.NewFlagSet("bench", flag.ContinueOnError)
+	backends := fs.String("backends", "all", "all, or a comma list: llama,mlx")
+	suites := fs.String("suites", "speed,tools,context", "comma list of speed, tools, context")
+	conc := fs.String("concurrency", "", "comma list of stream counts (default 1,2,4,8; --quick 1,4)")
+	contexts := fs.String("contexts", "", "comma list of prompt sizes, k = 1024 tokens (default 2k,32k; --quick 2k)")
+	quick := fs.Bool("quick", false, "a few minutes: one run per cell, one pass of the tools")
+	out := fs.String("out", "", "directory for report.md and results.json (default <dir>/bench/<timestamp>)")
+	runs := fs.Int("runs", 0, "runs per speed cell, median taken (default 3; --quick 1)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	opts := bench.Options{Suites: strings.Split(*suites, ","), Quick: *quick, Out: *out, Runs: *runs}
+	if *backends != "all" {
+		opts.Backends = strings.Split(*backends, ",")
+	}
+	var err error
+	if opts.Concurrency, err = bench.ParseList(*conc); err != nil {
+		return fmt.Errorf("--concurrency %w", err)
+	}
+	if opts.Contexts, err = bench.ParseList(*contexts); err != nil {
+		return fmt.Errorf("--contexts %w", err)
+	}
+	for _, s := range opts.Suites {
+		switch s {
+		case "speed", "tools", "context":
+		default:
+			return fmt.Errorf("--suites: unknown suite %q", s)
+		}
+	}
+	hw, err := linfer.Detect(linfer.SystemProbe(), cfg.Dir, cfg.GPU, linfer.MLXPython(cfg))
+	if err != nil {
+		return err
+	}
+	linfer.PrintHardware(os.Stdout, hw)
+	_, err = bench.New(cfg, hw, opts, os.Stdout).Run(ctx)
+	return err
 }
 
 func printJSON(v any) error {

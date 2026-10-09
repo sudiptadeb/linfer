@@ -55,20 +55,7 @@ func (s *Supervisor) prepare() (Plan, Command, error) {
 	s.mu.Unlock()
 	backend, reason := Choose(cfg, s.hw, FileExists)
 	s.log.Info(reason)
-	m, err := ReadModel(cfg, backend)
-	if err != nil {
-		return Plan{}, Command{}, fmt.Errorf("%w (run `linfer setup` to fetch what is missing)", err)
-	}
-	plan, err := Size(s.hw, m, backend, cfg)
-	if err != nil {
-		return plan, Command{}, err
-	}
-	if backend == BackendMLX {
-		if err := PrepareOMLX(cfg, plan); err != nil {
-			return plan, Command{}, err
-		}
-	}
-	return plan, CommandFor(cfg, plan), nil
+	return PlanFor(cfg, s.hw, backend)
 }
 
 // Run supervises until ctx is done. It never returns while the context

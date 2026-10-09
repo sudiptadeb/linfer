@@ -52,6 +52,11 @@ type Controller interface {
 // a daemon that died is removed; one that answers means another daemon is
 // running, which is an error rather than a silent takeover.
 func ServeControl(ctx context.Context, socket string, c Controller) error {
+	// sun_path is 104 bytes on macOS and 108 on Linux; bind fails with
+	// "invalid argument", which says nothing about why.
+	if len(socket) > 100 {
+		return fmt.Errorf("socket path %s is too long for a unix socket (%d bytes, at most 100); set a shorter dir", socket, len(socket))
+	}
 	if _, err := os.Stat(socket); err == nil {
 		if _, err := (Client{Socket: socket}).Status(ctx); err == nil {
 			return fmt.Errorf("another linfer answers on %s", socket)
