@@ -120,13 +120,16 @@ func (v Variant) config(cfg linfer.Config) linfer.Config {
 
 // Variants is every backend this machine can run for the configured model:
 // llama when there are GGUF weights, mlx on Apple Silicon when the MLX
-// weights and omlx exist.
+// weights and omlx exist. The configured backend does not narrow it: a
+// config pinned to llama is still compared against mlx.
 func Variants(cfg linfer.Config, hw linfer.Hardware) []Variant {
 	var out []Variant
 	if cfg.Model.GGUF != "" && linfer.FileExists(cfg.GGUFPath()) && linfer.FileExists(cfg.LlamaBinPath()) {
 		out = append(out, Variant{Name: "llama", Backend: linfer.BackendLlama})
 	}
-	if linfer.WantsMLX(cfg, hw) && linfer.FileExists(filepath.Join(cfg.MLXPath(), "config.json")) && linfer.FileExists(cfg.OMLXBinPath()) {
+	unpinned := cfg
+	unpinned.Backend = linfer.BackendAuto
+	if linfer.WantsMLX(unpinned, hw) && linfer.FileExists(filepath.Join(cfg.MLXPath(), "config.json")) && linfer.FileExists(cfg.OMLXBinPath()) {
 		out = append(out, Variant{Name: "mlx", Backend: linfer.BackendMLX})
 	}
 	return out
@@ -160,11 +163,16 @@ type Runner struct {
 	FreeMemory func() uint64
 	// HealthTimeout bounds a backend's load.
 	HealthTimeout time.Duration
+	// MemoryWait is how long to wait for memory to come free before a
+	// launch. macOS hands back a stopped model's memory over some seconds,
+	// so a check made just after pausing the daemon or stopping the
+	// previous backend reads low.
+	MemoryWait time.Duration
 }
 
 // New is the production runner.
 func New(cfg linfer.Config, hw linfer.Hardware, opts Options, out io.Writer) *Runner {
-	r := &Runner{Cfg: cfg, HW: hw, Opts: opts, Out: out, HealthTimeout: 20 * time.Minute}
+	r := &Runner{Cfg: cfg, HW: hw, Opts: opts, Out: out, HealthTimeout: 20 * time.Minute, MemoryWait: 2 * time.Minute}
 	r.Plan = func(v Variant) (linfer.Plan, string, error) {
 		c := v.config(cfg)
 		plan, _, err := linfer.PlanFor(c, hw, v.Backend)
@@ -342,7 +350,16 @@ func (r *Runner) runVariant(ctx context.Context, v Variant) BackendResult {
 	}
 	br.Plan, br.Weights, br.WeightGB = plan, weights, float64(plan.Weights)/linfer.GiB
 	if r.FreeMemory != nil {
-		if free := r.FreeMemory(); free > 0 && plan.Weights > free {
+		free := r.FreeMemory()
+		for deadline := time.Now().Add(r.MemoryWait); free > 0 && plan.Weights > free && time.Now().Before(deadline); free = r.FreeMemory() {
+			select {
+			case <-ctx.Done():
+				br.Error = ctx.Err().Error()
+				return br
+			case <-time.After(2 * time.Second):
+			}
+		}
+		if free > 0 && plan.Weights > free {
 			br.Error = fmt.Sprintf("%s of weights but only %s of memory free; stop what holds it first", linfer.HumanBytes(plan.Weights), linfer.HumanBytes(free))
 			r.say("  %s", br.Error)
 			return br
