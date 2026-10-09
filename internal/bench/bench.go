@@ -1,102 +1,36 @@
+// Package bench is `linfer bench`: it compares the backends this machine can
+// run for the configured model, one at a time, each launched with exactly
+// the profile serve would use, and hands each one's URL to linfer-bench,
+// which does the measuring, the scoring and the reports. This package only
+// does what needs linfer: which backends exist, pausing the serve daemon,
+// waiting for the memory, starting and stopping the backend, and the
+// launch details each row carries.
 package bench
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
+	lb "github.com/sudiptadeb/linfer-bench/bench"
 	"github.com/sudiptadeb/linfer/internal/linfer"
 )
 
-// Options is what `linfer bench` was asked for.
+// Options is what `linfer bench` was asked for: which backends, the tags
+// for the run, where the report goes, and linfer-bench's own options.
 type Options struct {
-	Backends    []string `json:"backends"` // variant names, or "all"
-	Suites      []string `json:"suites"`   // speed, tools, context
-	Concurrency []int    `json:"concurrency"`
-	Contexts    []int    `json:"contexts"` // prompt tokens
-	Quick       bool     `json:"quick"`
-	Out         string   `json:"out"`
-	// Filled from Quick when zero.
-	Runs         int   `json:"runs"`          // per speed cell
-	DecodeTokens int   `json:"decode_tokens"` // per stream
-	ToolRuns     int   `json:"tool_runs"`     // passes over the tool suite
-	Depths       []int `json:"depths"`        // needle depths, percent
-}
-
-// Defaults fills what was not given. Quick is a few minutes on a big model:
-// one run, two concurrency levels, one context, one pass of the tools.
-func (o *Options) Defaults() {
-	if len(o.Backends) == 0 {
-		o.Backends = []string{"all"}
-	}
-	if len(o.Suites) == 0 {
-		o.Suites = []string{"speed", "tools", "context"}
-	}
-	if o.Quick {
-		setIf(&o.Concurrency, []int{1, 4})
-		setIf(&o.Contexts, []int{2048})
-		setInt(&o.Runs, 1)
-		setInt(&o.DecodeTokens, 256)
-		setInt(&o.ToolRuns, 1)
-		setIf(&o.Depths, []int{50})
-	} else {
-		setIf(&o.Concurrency, []int{1, 2, 4, 8})
-		setIf(&o.Contexts, []int{2048, 32768})
-		setInt(&o.Runs, 3)
-		setInt(&o.DecodeTokens, 512)
-		setInt(&o.ToolRuns, 3)
-		setIf(&o.Depths, []int{10, 50, 90})
-	}
-}
-
-func setIf(p *[]int, v []int) {
-	if len(*p) == 0 {
-		*p = v
-	}
-}
-
-func setInt(p *int, v int) {
-	if *p == 0 {
-		*p = v
-	}
-}
-
-func (o Options) has(suite string) bool {
-	for _, s := range o.Suites {
-		if s == suite {
-			return true
-		}
-	}
-	return false
-}
-
-// ParseList reads "1,2,4,8" or "2k,32k" (k is 1024).
-func ParseList(s string) ([]int, error) {
-	if strings.TrimSpace(s) == "" {
-		return nil, nil
-	}
-	var out []int
-	for _, f := range strings.Split(s, ",") {
-		f = strings.TrimSpace(strings.ToLower(f))
-		mult := 1
-		if strings.HasSuffix(f, "k") {
-			mult, f = 1024, strings.TrimSuffix(f, "k")
-		}
-		n, err := strconv.Atoi(f)
-		if err != nil || n <= 0 {
-			return nil, fmt.Errorf("%q: want positive numbers such as 1,2,4 or 2k,32k", s)
-		}
-		out = append(out, n*mult)
-	}
-	return out, nil
+	Backends []string // variant names, or "all"
+	Tags     []string
+	Out      string
+	// Store is the linfer-bench results store; NoStore skips it.
+	Store   string
+	NoStore bool
+	Bench   lb.Options
 }
 
 // Variant is one row of the comparison: a backend, and later perhaps a
@@ -151,6 +85,8 @@ type Runner struct {
 	HW   linfer.Hardware
 	Opts Options
 	Out  io.Writer
+	// Color paints the terminal table.
+	Color bool
 	// Plan sizes the variant: its plan and which weights it will load.
 	Plan func(v Variant) (linfer.Plan, string, error)
 	// Start launches it and waits until it answers.
@@ -168,16 +104,6 @@ type Runner struct {
 	// so a check made just after pausing the daemon or stopping the
 	// previous backend reads low.
 	MemoryWait time.Duration
-	// Settle is the speed suite's pause between its cold and warm passes,
-	// for the backend to commit the prompts to its cache; zero means 2 s.
-	Settle time.Duration
-}
-
-func (r *Runner) settle() time.Duration {
-	if r.Settle > 0 {
-		return r.Settle
-	}
-	return 2 * time.Second
 }
 
 // New is the production runner.
@@ -218,15 +144,33 @@ func (r *Runner) say(format string, args ...any) {
 	fmt.Fprintf(r.Out, format+"\n", args...)
 }
 
+// Machine is the bench's view of the hardware linfer detected.
+func Machine(hw linfer.Hardware) lb.Machine {
+	gpu := hw.GPU
+	if hw.GPUName != "" {
+		gpu += " " + hw.GPUName
+	}
+	return lb.Machine{OS: hw.OS, Arch: hw.Arch, Chip: hw.Chip, CPUs: hw.CPUs, RAM: hw.RAM, GPU: gpu, GPUMem: hw.GPUMem, GPUMemSource: hw.GPUMemSource}
+}
+
 // Run does the whole comparison and writes the report.
-func (r *Runner) Run(ctx context.Context) (Results, error) {
-	r.Opts.Defaults()
-	res := Results{Started: time.Now(), Machine: r.HW, Model: r.Cfg.Model.ID, Options: r.Opts}
+func (r *Runner) Run(ctx context.Context) (lb.Results, error) {
+	r.Opts.Bench.Defaults()
+	if len(r.Opts.Backends) == 0 {
+		r.Opts.Backends = []string{"all"}
+	}
+	res := lb.Results{Schema: lb.SchemaVersion, Tool: "linfer bench (linfer-bench " + lb.Version + ")", Started: time.Now(),
+		Title: r.Cfg.Model.ID, Machine: Machine(r.HW), Options: r.Opts.Bench, Tags: r.Opts.Tags}
+	res.ID = lb.NewID(res.Started, res.Title)
 	variants, err := r.variants()
 	if err != nil {
 		return res, err
 	}
-	r.announce(variants)
+	suite, err := r.Opts.Bench.Suite()
+	if err != nil {
+		return res, fmt.Errorf("cases: %w", err)
+	}
+	r.announce(variants, len(suite.Cases), suite.Name)
 
 	// Pause the daemon for the duration; resume whatever happens, on a
 	// context of its own because the run's may have been cancelled.
@@ -260,19 +204,30 @@ func (r *Runner) Run(ctx context.Context) (Results, error) {
 		if ctx.Err() != nil {
 			break
 		}
-		res.Backends = append(res.Backends, r.runVariant(ctx, v))
+		res.Rows = append(res.Rows, r.runVariant(ctx, v))
 	}
 	res.Duration = time.Since(res.Started).Seconds()
-	if err := r.write(res); err != nil {
+	if r.Opts.Out == "" {
+		r.Opts.Out = filepath.Join(r.Cfg.Paths().Root, "bench", res.Started.Format("2006-01-02-150405"))
+	}
+	files, err := lb.WriteFiles(r.Opts.Out, res)
+	if err != nil {
 		return res, err
 	}
 	fmt.Fprintln(r.Out)
-	WriteTable(r.Out, res)
+	lb.Table(r.Out, res, r.Color)
 	fmt.Fprintln(r.Out)
-	for _, line := range Verdict(res) {
+	for _, line := range lb.Verdict(res) {
 		r.say("- %s", line)
 	}
-	r.say("\nreport: %s", filepath.Join(r.Opts.Out, "report.md"))
+	r.say("\nreport: %s", files[2])
+	if !r.Opts.NoStore {
+		if _, err := (lb.Store{Dir: r.Opts.Store}).Put(res); err != nil {
+			r.say("WARNING: could not store the run: %v", err)
+		} else {
+			r.say("stored as run %s (linfer-bench runs; linfer-bench compare --tags backend:llama,backend:mlx)", res.ID)
+		}
+	}
 	if ctx.Err() != nil {
 		return res, ctx.Err()
 	}
@@ -308,127 +263,110 @@ func (r *Runner) variants() ([]Variant, error) {
 }
 
 // announce says what will run and roughly how long, before anything loads.
-func (r *Runner) announce(variants []Variant) {
-	o := r.Opts
-	requests, seconds := 0, 0.0
-	if o.has("speed") {
-		for _, c := range o.Contexts {
-			for _, conc := range o.Concurrency {
-				requests += 2 * o.Runs * conc // a cold and a warm pass
-				// A rough cost model: prefill at 500 tok/s, the settle,
-				// decode at 30 tok/s per stream, concurrent streams sharing
-				// the decode.
-				seconds += float64(o.Runs) * (float64(c)/500*float64(conc) + r.settle().Seconds() + float64(o.DecodeTokens)/30*1.5)
-			}
-		}
-	}
-	if o.has("tools") {
-		requests += len(Cases) * o.ToolRuns
-		seconds += float64(len(Cases)*o.ToolRuns) * 8
-	}
-	if o.has("context") {
-		for _, c := range o.Contexts {
-			requests += len(o.Depths)
-			seconds += float64(len(o.Depths)) * (float64(c)/500 + 5)
-		}
-	}
+func (r *Runner) announce(variants []Variant, cases int, suite string) {
+	o := r.Opts.Bench
 	var names []string
 	for _, v := range variants {
 		names = append(names, v.Name)
 	}
+	requests, est := lb.Estimate(o, cases)
 	r.say("bench: %s on %s", r.Cfg.Model.ID, strings.Join(names, ", "))
-	r.say("  suites %s; contexts %v tokens; concurrency %v; %d run(s) per cell; %d pass(es) of %d tool cases",
-		strings.Join(o.Suites, ","), o.Contexts, o.Concurrency, o.Runs, o.ToolRuns, len(Cases))
-	est := time.Duration(seconds*float64(len(variants))) * time.Second
-	r.say("  about %d requests per backend; rough estimate %s plus loading each model", requests, est.Round(time.Minute))
+	r.say("  %s profile; suites %s; contexts %v tokens; concurrency %v; %d run(s) per cell; %d-token replies; %d pass(es) of %d tool cases (%s)",
+		o.Profile, strings.Join(o.Suites, ","), []int(o.Contexts), o.Concurrency, o.Runs, o.ReplyTokens, o.ToolPasses, cases, suite)
+	total := est * time.Duration(len(variants))
+	if total > 2*time.Minute {
+		total = total.Round(time.Minute)
+	} else {
+		total = total.Round(time.Second)
+	}
+	r.say("  about %d requests per backend; rough estimate %s plus loading each model", requests, total)
+	if len(r.Opts.Tags) > 0 {
+		r.say("  tags %s", strings.Join(r.Opts.Tags, ", "))
+	}
 }
 
-// runVariant loads one backend, runs the suites, stops it and waits for the
-// exit, so the next one finds the memory free.
-func (r *Runner) runVariant(ctx context.Context, v Variant) BackendResult {
-	br := BackendResult{Name: v.Name, Backend: v.Backend}
+// runVariant loads one backend, runs the suites through linfer-bench, stops
+// it and waits for the exit, so the next one finds the memory free.
+func (r *Runner) runVariant(ctx context.Context, v Variant) lb.Row {
+	row := lb.Row{Label: v.Name, Target: v.Name, URL: r.Cfg.URL(), Model: r.Cfg.Model.ID, Tags: []string{"backend:" + v.Name}, Started: time.Now()}
 	r.say("\n== %s", v.Name)
 	plan, weights, err := r.Plan(v)
 	if err != nil {
-		br.Error = err.Error()
-		r.say("  %s", br.Error)
-		return br
+		row.Error = err.Error()
+		r.say("  %s", row.Error)
+		return row
 	}
-	br.Plan, br.Weights, br.WeightGB = plan, weights, float64(plan.Weights)/linfer.GiB
+	row.Info = []lb.KV{{Key: "weights", Value: fmt.Sprintf("%.1f GiB", float64(plan.Weights)/linfer.GiB)}, {Key: "launch", Value: launch(v, plan)}}
 	if r.FreeMemory != nil {
 		free := r.FreeMemory()
 		for deadline := time.Now().Add(r.MemoryWait); free > 0 && plan.Weights > free && time.Now().Before(deadline); free = r.FreeMemory() {
 			select {
 			case <-ctx.Done():
-				br.Error = ctx.Err().Error()
-				return br
+				row.Error = ctx.Err().Error()
+				return row
 			case <-time.After(2 * time.Second):
 			}
 		}
 		if free > 0 && plan.Weights > free {
-			br.Error = fmt.Sprintf("%s of weights but only %s of memory free; stop what holds it first", linfer.HumanBytes(plan.Weights), linfer.HumanBytes(free))
-			r.say("  %s", br.Error)
-			return br
+			row.Error = fmt.Sprintf("%s of weights but only %s of memory free; stop what holds it first", linfer.HumanBytes(plan.Weights), linfer.HumanBytes(free))
+			r.say("  %s", row.Error)
+			return row
 		}
 	}
 	if answers(r.Cfg.URL() + "/models") {
-		br.Error = "something already answers on " + r.Cfg.Listen + "; stop it first"
-		r.say("  %s", br.Error)
-		return br
+		row.Error = "something already answers on " + r.Cfg.Listen + "; stop it first"
+		r.say("  %s", row.Error)
+		return row
 	}
-	r.say("  loading %s (%.1f GiB) …", weights, br.WeightGB)
+	r.say("  loading %s (%s) …", weights, row.Info[0].Value)
 	t0 := time.Now()
 	run, err := r.Start(ctx, v, plan)
 	if err != nil {
-		br.Error = err.Error()
-		r.say("  %s", br.Error)
-		return br
+		row.Error = err.Error()
+		r.say("  %s", row.Error)
+		return row
 	}
-	br.LoadS = time.Since(t0).Seconds()
+	loadS := time.Since(t0).Seconds()
 	defer func() {
 		r.say("  stopping %s …", v.Name)
 		run.Stop()
 		r.say("  stopped")
 	}()
-	br.RSS = run.RSS()
-	r.say("  up in %.0fs, rss %s", br.LoadS, linfer.HumanBytes(br.RSS))
+	rss := run.RSS()
+	r.say("  up in %.0fs, rss %s", loadS, linfer.HumanBytes(rss))
 
-	cl := newClient(r.Cfg.URL(), r.Cfg.Model.ID)
-	// Warm-up: the first request after a load pays for buffers and compiles.
-	if st := cl.Complete(ctx, []Message{{Role: "user", Content: "Say hello."}}, 8); st.Err != "" {
-		br.Failures = append(br.Failures, "warm-up: "+st.Err)
-	}
-	cpt, err := calibrate(ctx, cl)
-	if err != nil {
-		br.Failures = append(br.Failures, err.Error())
-		cpt = 3.8
-	}
 	maxCtx := plan.Context
 	if v.Backend == linfer.BackendMLX {
 		maxCtx = plan.ContextWindow
 	}
-	progress := func(s string) { r.say("%s", s) }
-	if r.Opts.has("speed") && ctx.Err() == nil {
-		r.say("  speed")
-		br.Speed = runSpeed(ctx, cl, speedPlan{
-			contexts: r.Opts.Contexts, concurrency: r.Opts.Concurrency, runs: r.Opts.Runs,
-			decodeTokens: r.Opts.DecodeTokens, charsPerToken: cpt, maxContext: maxCtx, settle: r.settle(),
-		}, progress)
-	}
-	if r.Opts.has("tools") && ctx.Err() == nil {
-		r.say("  tools")
-		ts := runTools(ctx, cl, r.Opts.ToolRuns, progress)
-		br.Tools = &ts
-	}
-	if r.Opts.has("context") && ctx.Err() == nil {
-		r.say("  context")
-		br.Context = runContext(ctx, cl, r.Opts.Contexts, r.Opts.Depths, cpt, maxCtx, progress)
-	}
+	pair := lb.Pair{Target: lb.Target{Name: v.Name, URL: r.Cfg.URL(), MaxContext: maxCtx}, Model: r.Cfg.Model.ID, Label: v.Name}
+	measured := lb.RunRow(ctx, pair, r.Opts.Bench, func(e lb.Event) {
+		switch {
+		case e.Suite == "":
+			r.say("  %s", e.Text)
+		case e.Text == e.Suite || strings.HasPrefix(e.Text, e.Suite+" "):
+			r.say("  %s", e.Text)
+		default:
+			r.say("    %s", e.Text)
+		}
+	})
+	// Keep what this side knows about the row: the weights and launch, the
+	// load time and memory, the backend tag.
+	measured.Label, measured.Tags = row.Label, row.Tags
+	measured.Info = append(row.Info, lb.KV{Key: "load", Value: fmt.Sprintf("%.0fs, rss %s", loadS, linfer.HumanBytes(max(rss, run.RSS())))})
 	if exited, why := run.Exited(); exited {
-		br.Failures = append(br.Failures, "the backend exited during the run: "+why)
+		measured.Failures = append(measured.Failures, "the backend exited during the run: "+why)
 	}
-	br.RSS = max(br.RSS, run.RSS())
-	return br
+	return measured
+}
+
+// launch is the one-line launch profile: slots and context for llama,
+// concurrency and window for mlx.
+func launch(v Variant, p linfer.Plan) string {
+	if v.Backend == linfer.BackendMLX {
+		return fmt.Sprintf("%d concurrent, window %d", p.MaxConcurrent, p.ContextWindow)
+	}
+	return fmt.Sprintf("%d×%d, cache %d MB", p.Slots, p.Context, p.CacheRAMMB)
 }
 
 func answers(url string) bool {
@@ -439,23 +377,4 @@ func answers(url string) bool {
 	}
 	resp.Body.Close()
 	return true
-}
-
-// write puts results.json and report.md in Out.
-func (r *Runner) write(res Results) error {
-	if r.Opts.Out == "" {
-		r.Opts.Out = filepath.Join(r.Cfg.Paths().Root, "bench", res.Started.Format("2006-01-02-150405"))
-		res.Options.Out = r.Opts.Out
-	}
-	if err := os.MkdirAll(r.Opts.Out, 0o755); err != nil {
-		return err
-	}
-	raw, err := json.MarshalIndent(res, "", "  ")
-	if err != nil {
-		return err
-	}
-	if err := os.WriteFile(filepath.Join(r.Opts.Out, "results.json"), raw, 0o644); err != nil {
-		return err
-	}
-	return os.WriteFile(filepath.Join(r.Opts.Out, "report.md"), []byte(Markdown(res)), 0o644)
 }

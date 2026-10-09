@@ -1,6 +1,7 @@
 package bench
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	lb "github.com/sudiptadeb/linfer-bench/bench"
 	"github.com/sudiptadeb/linfer/internal/linfer"
 )
 
@@ -45,7 +47,7 @@ func fakeBackend() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
 	mux.HandleFunc("/v1/models", func(w http.ResponseWriter, r *http.Request) {
-		io.WriteString(w, `{"data":[{"id":"fake"}]}`)
+		io.WriteString(w, `{"data":[{"id":"fake","owned_by":"llamacpp"}]}`)
 	})
 	mux.HandleFunc("/v1/chat/completions", fakeChat)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM)
@@ -56,12 +58,15 @@ func fakeBackend() {
 	srv.Close()
 }
 
+func call(id, name, args string) lb.ToolCall {
+	return lb.ToolCall{ID: id, Type: "function", Function: lb.FunctionCall{Name: name, Arguments: args}}
+}
+
 func fakeChat(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Messages  []Message `json:"messages"`
-		Stream    bool      `json:"stream"`
-		MaxTokens int       `json:"max_tokens"`
-		Tools     []Tool    `json:"tools"`
+		Messages  []lb.Message `json:"messages"`
+		Stream    bool         `json:"stream"`
+		MaxTokens int          `json:"max_tokens"`
 	}
 	body, _ := io.ReadAll(r.Body)
 	json.Unmarshal(body, &req)
@@ -96,7 +101,7 @@ func fakeChat(w http.ResponseWriter, r *http.Request) {
 	// The tool suite, answered correctly, with one deliberate miss: the
 	// calendar event's location as a string, so a failure shows in the report.
 	msg := map[string]any{"role": "assistant", "content": nil}
-	calls := func(cs ...ToolCall) { msg["tool_calls"] = cs }
+	calls := func(cs ...lb.ToolCall) { msg["tool_calls"] = cs }
 	text := strings.ToLower(last.Content)
 	switch {
 	case last.Role == "tool":
@@ -156,8 +161,9 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 // testSetup: a config whose files exist (so the llama variant is available),
 // a serve daemon on its own port with the fake backend, and a runner that
 // launches the fake backend on the config's listen port through
-// linfer.Start, as production does.
-func testSetup(t *testing.T) (linfer.Config, *linfer.Supervisor, *Runner, *bool) {
+// linfer.Start, as production does. The runner's output is returned for
+// the tests to read.
+func testSetup(t *testing.T) (linfer.Config, *linfer.Supervisor, *Runner, *bool, *bytes.Buffer) {
 	t.Helper()
 	// A short directory: a unix socket path is limited to 104 bytes on
 	// macOS, and t.TempDir() carries the test's name.
@@ -192,12 +198,14 @@ func testSetup(t *testing.T) (linfer.Config, *linfer.Supervisor, *Runner, *bool)
 	waitFor(t, "daemon healthy", func() bool { return s.Status().Healthy })
 
 	pausedDuring := false
-	r := New(cfg, hw, Options{Quick: true, Contexts: []int{128}, Concurrency: []int{1, 2}, Out: filepath.Join(dir, "out")}, io.Discard)
+	var out bytes.Buffer
+	opts := Options{Out: filepath.Join(dir, "out"), Store: filepath.Join(dir, "store"), Tags: []string{"test"},
+		Bench: lb.Options{Profile: lb.ProfileQuick, Contexts: lb.Sizes{128}, Concurrency: []int{1, 2}, ReplyTokens: 7, Settle: lb.Duration(10 * time.Millisecond)}}
+	r := New(cfg, hw, opts, &out)
 	r.Plan = func(v Variant) (linfer.Plan, string, error) {
-		return linfer.Plan{Backend: v.Backend, Slots: 2, Context: 4096, Weights: 100 * linfer.MiB}, cfg.GGUFPath(), nil
+		return linfer.Plan{Backend: v.Backend, Slots: 2, Context: 4096, CacheRAMMB: 256, Weights: 100 * linfer.MiB}, cfg.GGUFPath(), nil
 	}
 	r.FreeMemory = func() uint64 { return 1 << 40 }
-	r.Settle = 10 * time.Millisecond
 	r.Start = func(ctx context.Context, v Variant, plan linfer.Plan) (*Running, error) {
 		// Seen from the launch: the daemon must be paused by now.
 		if st, err := (linfer.Client{Socket: cfg.Paths().Socket}).Status(ctx); err == nil && st.Paused && st.PID == 0 {
@@ -213,14 +221,15 @@ func testSetup(t *testing.T) (linfer.Config, *linfer.Supervisor, *Runner, *bool)
 		}
 		return &Running{Plan: plan, RSS: p.RSS, Exited: p.Exited, Stop: func() { p.Stop(5 * time.Second) }}, nil
 	}
-	return cfg, s, r, &pausedDuring
+	return cfg, s, r, &pausedDuring, &out
 }
 
 // A full quick run against the fake backend: the daemon is paused while the
 // bench's own backend runs and resumed after; every suite produces rows;
-// the report files are written; the deliberate tool miss is listed.
+// the row carries the launch details and the backend tag; the report files
+// are written and the run is stored; the deliberate tool miss is listed.
 func TestRunPausesDaemonAndReports(t *testing.T) {
-	cfg, s, r, pausedDuring := testSetup(t)
+	cfg, s, r, pausedDuring, out := testSetup(t)
 	res, err := r.Run(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -232,27 +241,33 @@ func TestRunPausesDaemonAndReports(t *testing.T) {
 		st := s.Status()
 		return !st.Paused && st.Healthy
 	})
-	if len(res.Backends) != 1 || res.Backends[0].Name != "llama" || res.Backends[0].Error != "" {
-		t.Fatalf("backends %+v", res.Backends)
+	if len(res.Rows) != 1 || res.Rows[0].Label != "llama" || res.Rows[0].Error != "" || res.Title != "fake" || res.ID == "" || res.Tags[0] != "test" {
+		t.Fatalf("results %+v", res)
 	}
-	b := res.Backends[0]
+	b := res.Rows[0]
+	if b.Server != "llama.cpp" || b.Tags[0] != "backend:llama" || len(b.Info) != 3 || b.Info[0].Value != "0.1 GiB" || b.Info[1].Value != "2×4096, cache 256 MB" || !strings.HasPrefix(b.Info[2].Key, "load") {
+		t.Errorf("row details %+v %+v", b.Info, b.Tags)
+	}
 	if len(b.Speed) != 2 || b.Speed[0].DecodeTPS.N == 0 || b.Speed[0].WarmTTFT.N == 0 || b.Speed[1].Concurrency != 2 || b.Speed[1].CombinedTPS.N == 0 {
 		t.Errorf("speed rows %+v", b.Speed)
 	}
 	if b.Speed[0].Server["timings.predicted_per_second"] != 123 {
 		t.Errorf("server timings not kept: %v", b.Speed[0].Server)
 	}
-	if b.Tools == nil || b.Tools.Cases != len(Cases) || b.Tools.Passed != len(Cases)-1 || len(b.Tools.Failures) != 1 ||
+	if b.Tools == nil || b.Tools.Cases != 9 || b.Tools.Passed != 8 || len(b.Tools.Failures) != 1 ||
 		!strings.Contains(b.Tools.Failures[0], "location: is a string") {
 		t.Errorf("tools %+v", b.Tools)
 	}
 	if len(b.Context) != 1 || !b.Context[0].Found {
 		t.Errorf("context %+v", b.Context)
 	}
-	for _, f := range []string{"results.json", "report.md"} {
+	for _, f := range []string{"results.json", "report.md", "report.html"} {
 		if _, err := os.Stat(filepath.Join(r.Opts.Out, f)); err != nil {
 			t.Error(err)
 		}
+	}
+	if _, err := os.Stat(filepath.Join(r.Opts.Store, res.ID+".json")); err != nil {
+		t.Error("the run is not in the store:", err)
 	}
 	if len(res.Notes) == 0 || !strings.Contains(res.Notes[0], "paused for the run") {
 		t.Errorf("notes %v", res.Notes)
@@ -260,12 +275,17 @@ func TestRunPausesDaemonAndReports(t *testing.T) {
 	if _, err := os.Stat(cfg.Paths().Socket); err != nil {
 		t.Error("the daemon's socket is gone")
 	}
+	for _, want := range []string{"bench: fake on llama", "quick profile", "9 tool cases (builtin)", "pausing the linfer daemon", "== llama", "loading", "up in", "llama.cpp; timings", "128 × 1:", "ok   calculator", "FAIL nested object", "metric", "launch", "tools accuracy", "89% (8/9)", "stored as run", "linfer daemon resumed"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("output lacks %q:\n%s", want, out.String())
+		}
+	}
 }
 
 // When the bench backend fails to start, or the run is cancelled, the
 // daemon is still resumed.
 func TestRunResumesDaemonOnFailure(t *testing.T) {
-	_, s, r, _ := testSetup(t)
+	_, s, r, _, _ := testSetup(t)
 	r.Start = func(context.Context, Variant, linfer.Plan) (*Running, error) {
 		return nil, fmt.Errorf("the backend died loading")
 	}
@@ -273,8 +293,8 @@ func TestRunResumesDaemonOnFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Backends[0].Error != "the backend died loading" {
-		t.Errorf("error not recorded: %+v", res.Backends[0])
+	if res.Rows[0].Error != "the backend died loading" {
+		t.Errorf("error not recorded: %+v", res.Rows[0])
 	}
 	waitFor(t, "daemon resumed after failure", func() bool { return !s.Status().Paused && s.Status().Healthy })
 
@@ -289,7 +309,7 @@ func TestRunResumesDaemonOnFailure(t *testing.T) {
 
 // An already-paused daemon is left alone: whoever paused it wants it so.
 func TestRunLeavesPausedDaemonPaused(t *testing.T) {
-	_, s, r, _ := testSetup(t)
+	_, s, r, _, _ := testSetup(t)
 	if err := s.Pause(); err != nil {
 		t.Fatal(err)
 	}
@@ -306,5 +326,50 @@ func TestRunLeavesPausedDaemonPaused(t *testing.T) {
 	}
 	if len(res.Notes) == 0 || !strings.Contains(res.Notes[0], "already paused") {
 		t.Errorf("notes %v", res.Notes)
+	}
+}
+
+// The launch waits for memory that is still being handed back.
+func TestRunWaitsForMemoryToComeFree(t *testing.T) {
+	_, _, r, _, _ := testSetup(t)
+	calls := 0
+	r.FreeMemory = func() uint64 {
+		calls++
+		if calls < 3 {
+			return linfer.MiB // the previous model is still letting go
+		}
+		return 1 << 40
+	}
+	r.MemoryWait = 30 * time.Second
+	res, err := r.Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Rows) != 1 || res.Rows[0].Error != "" {
+		t.Fatalf("rows %+v", res.Rows)
+	}
+}
+
+// A config pinned to llama still compares against mlx when its weights and
+// omlx exist.
+func TestVariantsComparesMLXEvenWhenPinnedToLlama(t *testing.T) {
+	dir := t.TempDir()
+	for _, f := range []string{"model.gguf", "llama-server", "omlx", "mlx/config.json"} {
+		os.MkdirAll(filepath.Dir(filepath.Join(dir, f)), 0o755)
+		os.WriteFile(filepath.Join(dir, f), []byte("x"), 0o755)
+	}
+	cfg := linfer.Config{Backend: linfer.BackendLlama, LlamaBin: filepath.Join(dir, "llama-server"), OMLXBin: filepath.Join(dir, "omlx"),
+		Model: linfer.Model{ID: "m", GGUF: filepath.Join(dir, "model.gguf"), MLX: filepath.Join(dir, "mlx")}}
+	got := Variants(cfg, linfer.Hardware{OS: "darwin", Arch: "arm64"})
+	if len(got) != 2 || got[0].Name != "llama" || got[1].Name != "mlx" {
+		t.Fatalf("variants %+v", got)
+	}
+}
+
+// The machine linfer detected carries over with its GPU detail.
+func TestMachine(t *testing.T) {
+	m := Machine(linfer.Hardware{OS: "darwin", Arch: "arm64", Chip: "Apple M3 Ultra", CPUs: 32, RAM: 256 * linfer.GiB, GPU: "metal", GPUMem: 222 * linfer.GiB, GPUMemSource: "measured"})
+	if m.String() != "darwin/arm64, Apple M3 Ultra, 32 CPUs, 256.0 GiB RAM, GPU metal 222.0 GiB (measured)" {
+		t.Errorf("machine %q", m.String())
 	}
 }
