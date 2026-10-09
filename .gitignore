@@ -1,0 +1,6 @@
+# Build output.
+dist/
+
+# Local scratch: a test config, downloaded test models, logs.
+.tmp/
+*.log
