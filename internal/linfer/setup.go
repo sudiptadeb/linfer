@@ -52,7 +52,8 @@ func (r *Report) inspect(cfg Config, hw Hardware) {
 	}
 	if cfg.Model.GGUF != "" {
 		r.GGUF = cfg.GGUFPath()
-		r.GGUFOK = FileExists(r.GGUF) && (cfg.Model.MMProj == "" || FileExists(cfg.MMProjPath()))
+		r.GGUFOK = FileExists(r.GGUF) && (cfg.Model.MMProj == "" || FileExists(cfg.MMProjPath())) &&
+			(cfg.Model.MTP == "" || FileExists(cfg.MTPPath()))
 		if !r.GGUFOK {
 			r.Problems = append(r.Problems, "no GGUF weights at "+r.GGUF)
 		}
@@ -157,6 +158,11 @@ func Setup(ctx context.Context, cfg Config, f *Fetcher, out io.Writer) (Report, 
 		}
 		if cfg.Model.MMProj != "" {
 			if err := fetchFile(ctx, cfg, hw, f, cfg.Model.MMProj, cfg.MMProjPath(), false, say); err != nil {
+				return r, err
+			}
+		}
+		if cfg.Model.MTP != "" {
+			if err := fetchFile(ctx, cfg, hw, f, cfg.Model.MTP, cfg.MTPPath(), false, say); err != nil {
 				return r, err
 			}
 		}

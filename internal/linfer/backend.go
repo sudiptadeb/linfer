@@ -67,13 +67,21 @@ type Command struct {
 // honest); batch 2048 / micro-batch 512; the model's own sampling (temp 1.0,
 // top-k 20, top-p 0.95, min-p 0, no repeat penalty), since llama-server's
 // defaults (0.8, 40, 0.05) are not what the model card says; and the
-// reasoning effort for the template. No speculative decoding: n-gram
-// drafting was tried and judged an over-optimisation for agent traffic.
+// reasoning effort for the template. Speculative decoding only from the
+// model's own MTP head (model.mtp); n-gram drafting from the context was
+// tried and judged an over-optimisation for agent traffic.
 func LlamaCommand(cfg Config, p Plan) Command {
 	host, port := splitListen(cfg.Listen)
 	args := []string{"--model", cfg.GGUFPath()}
 	if cfg.Model.MMProj != "" {
 		args = append(args, "--mmproj", cfg.MMProjPath())
+	}
+	if cfg.Model.MTP != "" {
+		// Probabilistic acceptance keeps the sampled distribution exact at
+		// temperature 1; three drafted tokens measured best (two and greedy
+		// acceptance were slower). -b 2048 covers np×(1+3).
+		args = append(args, "-md", cfg.MTPPath(), "--spec-type", "draft-mtp",
+			"--spec-draft-n-max", "3", "--spec-draft-sampling", "probabilistic")
 	}
 	args = append(args,
 		"--host", host, "--port", port,

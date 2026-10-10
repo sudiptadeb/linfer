@@ -28,12 +28,13 @@ type ModelInfo struct {
 	HeadK, HeadV       int   // dimensions of one key and one value head
 	Context            int   // the trained context length
 	WeightBytes        int64 // all the weight files, as they are on disk
+	DraftKV            int64 // KV bytes per token of the MTP head, when there is one
 }
 
 // KVBytesPerToken is the KV cache one token costs across all attention
 // layers at f16: K and V, 2 bytes each element.
 func (m ModelInfo) KVBytesPerToken() int64 {
-	return int64(m.AttnLayers) * int64(m.KVHeads) * int64(m.HeadK+m.HeadV) * 2
+	return int64(m.AttnLayers)*int64(m.KVHeads)*int64(m.HeadK+m.HeadV)*2 + m.DraftKV
 }
 
 // --- GGUF -------------------------------------------------------------------------
@@ -378,6 +379,18 @@ func ReadModel(cfg Config, backend string) (ModelInfo, error) {
 				return m, err
 			}
 			m.WeightBytes += st.Size()
+		}
+		if p := cfg.MTPPath(); p != "" {
+			// The head is weights like the rest, and drafting keeps a KV
+			// cache of its own for every slot: one attention block's worth.
+			// Its file repeats the parent's metadata, so its layer counts
+			// describe the parent, not the head.
+			d, err := ReadGGUF(p)
+			if err != nil {
+				return m, err
+			}
+			m.WeightBytes += d.WeightBytes
+			m.DraftKV = int64(d.KVHeads) * int64(d.HeadK+d.HeadV) * 2
 		}
 		return m, nil
 	case BackendMLX:

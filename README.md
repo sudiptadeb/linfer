@@ -97,6 +97,7 @@ model:
   id: qwen3-coder:30b-q8_0    # what the client names; the same on every backend
   gguf: hf://Qwen/Qwen3-Coder-30B-A3B-Instruct-GGUF/Qwen3-Coder-30B-A3B-Instruct-Q8_0.gguf
   # mmproj: hf://…            # a vision projector, if the model has one
+  # mtp: hf://…               # llama.cpp: the model's multi-token-prediction head, for faster decode
   # mlx: hf://mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit   # lets auto pick oMLX on Apple Silicon
   # slots: 8                  # llama-server parallel slots; 0 = auto
   # context: 131072           # tokens per slot; 0 = auto
@@ -150,11 +151,16 @@ system RAM on a discrete GPU; slots start at 8 (budget ≥ 64 GiB), 4 or 2;
 context per slot starts at the smaller of the model's context and 131,072.
 The KV cache a token costs is read from the GGUF header (attention layers ×
 KV heads × head size × 2 bytes × K and V; hybrid models count only their
-full-attention layers). While slots × context × KV exceeds what is left,
+full-attention layers; an MTP head adds one more). While slots × context × KV exceeds what is left,
 context halves down to 32k, then slots halve, then context halves down to
 8k. The rest of the launch profile is fixed and measured: 4 restore points
 per slot, flash attention, `--jinja`, batch 2048 / micro-batch 512, the
-model's own sampling, no speculative decoding.
+model's own sampling. With `model.mtp` set, the model's own multi-token
+prediction head drafts up to 3 tokens a step (`--spec-type draft-mtp`,
+probabilistic acceptance, so the output distribution is unchanged); on the
+125B model above it took one stream from 36 to 50 tok/s at 16k context and
+from 30 to 51 at 48k, for 10% less combined output at eight streams × 48k.
+No drafting from the prompt's own text: agent traffic gains too little.
 
 **oMLX.** The context window is the model's; concurrency is the headroom
 divided by one full window of KV, at most 6. `model_settings.json` gets

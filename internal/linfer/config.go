@@ -100,6 +100,12 @@ type Model struct {
 	GGUF string `yaml:"gguf"`
 	// MMProj is the vision projector that goes with GGUF, same forms. Optional.
 	MMProj string `yaml:"mmproj"`
+	// MTP is the model's multi-token-prediction head as a GGUF of its own
+	// (ggml-org publishes them as mtp-<model>.gguf), same forms. Optional.
+	// With it llama-server drafts three tokens ahead from the model's own
+	// head and keeps only what the full model would have sampled, so replies
+	// come faster with the same distribution.
+	MTP string `yaml:"mtp"`
 	// MLX is the MLX weights directory for oMLX: a path, or hf://<org>/<repo>.
 	MLX string `yaml:"mlx"`
 	// Slots and Context (tokens per slot) size llama-server: -np Slots and
@@ -167,7 +173,7 @@ func (c *Config) defaults() {
 	if c.Dir == "" {
 		c.Dir = DefaultDir()
 	}
-	for _, p := range []*string{&c.LlamaBin, &c.OMLXBin, &c.Python, &c.Dir, &c.Model.GGUF, &c.Model.MMProj, &c.Model.MLX} {
+	for _, p := range []*string{&c.LlamaBin, &c.OMLXBin, &c.Python, &c.Dir, &c.Model.GGUF, &c.Model.MMProj, &c.Model.MTP, &c.Model.MLX} {
 		*p = expandHome(*p)
 	}
 }
@@ -207,7 +213,7 @@ func (c Config) check() error {
 	if m.Slots < 0 || m.Context < 0 || c.CacheRAMMB < 0 || c.MaxConcurrent < 0 {
 		return fmt.Errorf("slots, context, cache_ram_mb and max_concurrent are 0 (auto) or positive")
 	}
-	for _, ref := range []string{m.GGUF, m.MMProj} {
+	for _, ref := range []string{m.GGUF, m.MMProj, m.MTP} {
 		if isHF(ref) {
 			if _, _, _, err := splitHF(ref, true); err != nil {
 				return err
@@ -268,10 +274,11 @@ func (c Config) OMLXBinPath() string {
 	return filepath.Join(c.Paths().Venv, "bin", "omlx")
 }
 
-// GGUFPath, MMProjPath and MLXPath are where the weights are, or will be
-// after setup: a local path as given, an hf:// reference under Models.
+// GGUFPath, MMProjPath, MTPPath and MLXPath are where the weights are, or
+// will be after setup: a local path as given, an hf:// reference under Models.
 func (c Config) GGUFPath() string   { return c.localPath(c.Model.GGUF, true) }
 func (c Config) MMProjPath() string { return c.localPath(c.Model.MMProj, true) }
+func (c Config) MTPPath() string    { return c.localPath(c.Model.MTP, true) }
 func (c Config) MLXPath() string    { return c.localPath(c.Model.MLX, false) }
 
 func (c Config) localPath(ref string, file bool) string {

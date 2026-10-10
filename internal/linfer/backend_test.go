@@ -42,6 +42,18 @@ func TestLlamaCommand(t *testing.T) {
 	}
 }
 
+// An MTP head adds the draft flags right after the weights.
+func TestLlamaCommandMTP(t *testing.T) {
+	cfg := testConfig(t, "/var/linfer")
+	cfg.Model.MTP = "/models/q8/mtp.gguf"
+	cmd := LlamaCommand(cfg, Plan{Backend: BackendLlama, Slots: 8, Context: 131072, CacheRAMMB: 16384})
+	want := `--mmproj /models/q8/mmproj.gguf -md /models/q8/mtp.gguf --spec-type draft-mtp ` +
+		`--spec-draft-n-max 3 --spec-draft-sampling probabilistic --host`
+	if got := strings.Join(cmd.Args, " "); !strings.Contains(got, want) {
+		t.Errorf("got\n%s\nwant it to contain\n%s", got, want)
+	}
+}
+
 // The oMLX command line: linfer's own model and state directories, the
 // concurrency from the plan, and no Hugging Face cache scan.
 func TestOMLXCommand(t *testing.T) {
